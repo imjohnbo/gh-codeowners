@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""
+gh-codeowners - A GitHub CLI extension to query CODEOWNERS information
+"""
+
+import os
+import sys
+import time
+import argparse
+import fnmatch
+import json
+import re
+from pathlib import Path
+from functools import lru_cache
+import subprocess
+from typing import Dict, List, Set, Optional, Tuple
+from dataclasses import dataclass, asdict
+import tempfile
+
+@dataclass
+class ValidationIssue:
+    level: str  # 'error' or 'warning'
+    message: str
+    line_number: Optional[int] = None
+    pattern: Optional[str] = None
+
+@dataclass
+class CodeownersRule:
+    pattern: str
+    regex: re.Pattern
+    owners: List[str]
+    negation: bool = False
+    line_number: int = 0
+
+class CodeownersParser:
+    def __init__(self, repo_root="."):
+        self.repo_root = Path(repo_root).resolve()
+        self.rules: List[CodeownersRule] = []
+        self.cache_file = self._get_cache_file()
+        self.cache_ttl = 3600  # 1 hour
+        self.load_codeowners()
+        self._team_cache: Dict[str, bool] = {}
+
+    def _get_cache_file(self) -> Path:
+        """Get repository-specific cache file path"""
+        try:
+            # Get repository root using git
+            result = subprocess.run(
+                ['git', 'rev-parse', '--show-toplevel'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            repo_path = result.stdout.strip()
+            
+            # Create a unique identifier for this repository
+            repo_hash = str(hash(repo_path))
+            
+            # Create cache file path with repository identifier
+            return Path(tempfile.gettempdir()) / f"gh-codeowners-cache-{repo_hash}.json"
+        except subprocess.CalledProcessError:
+            # Fallback to default cache file if not in a git repository
+            return Path(tempfile.gettempdir()) / "gh-codeowners-cache-default.json"
+
+    def _load_cache(self) -> Dict:
+        """Load cached results if they exist and are fresh"""
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    
+                # Check if cache is for current repository path
+                if (cache_data.get('repo_path') == str(self.repo_root) and 
+                    cache_data.get('timestamp', 0) + self.cache_ttl > time.time()):
+                    return cache_data.get('data', {})
+            except (json.JSONDecodeError, KeyError):
+                pass
+        return {}
+
+    def _save_cache(self, data: Dict):
+        """Save results to cache"""
+        cache_data = {
+            'timestamp': time.time(),
+            'repo_path': str(self.repo_root),
+            'data': data
+        }
+        try:
+            cache_dir = self.cache_file.parent
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.cache_file, 'w') as f:
+                json.dump(cache_data, f)
+        except Exception as e:
+            print(f"Warning: Failed to save cache: {e}", file=sys.stderr)
+
+    def clear_cache(self):
+        """Clear the cache for the current repository"""
+        if self.cache_file.exists():
+            try:
+                os.remove(self.cache_file)
+            except Exception as e:
+                print(f"Warning: Failed to clear cache: {e}", file=sys.stderr)
+
+    def load_codeowners(self):
+        """Load CODEOWNERS files from all standard locations"""
+        codeowners_paths = [
+            self.repo_root / "CODEOWNERS",
+            self.repo_root / ".github" / "CODEOWNERS",
+            self.repo_root / "docs" / "CODEOWNERS"
+        ]
+
+        rules_found = False
+        for path in codeowners_paths:
+            if path.exists():
+                with open(path, 'r') as f:
+                    self._parse_rules(f.readlines(), path)
+                rules_found = True
+
+        if not rules_found:
+            print("Error: No CODEOWNERS file found", file=sys.stderr)
+            sys.exit(1)
+
+    def _parse_rules(self, lines: List[str], file_path: Path):
+        """Parse CODEOWNERS rules from file content"""
+        for line_number, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) >= 2:
+                pattern = parts[0]
+                owners = parts[1:]
+                
+                # Handle pattern negation
+                negation = pattern.startswith('!')
+                if negation:
+                    pattern = pattern[1:]
+
+                # Convert pattern to regex
+                try:
+                    regex = self._pattern_to_regex(pattern)
+                    rule = CodeownersRule(
+                        pattern=pattern,
+                        regex=regex,
+                        owners=owners,
+                        negation=negation,
+                        line_number=line_number
+                    )
+                    self.rules.append(rule)
+                except re.error as e:
+                    print(f"Warning: Invalid pattern '{pattern}' in {file_path} line {line_number}: {e}",
+                          file=sys.stderr)
+
+    def _pattern_to_regex(self, pattern: str) -> re.Pattern:
+        """Convert a gitignore-style pattern to regex"""
+        if pattern.startswith('/'):
+            pattern = pattern[1:]
+        elif pattern.endswith('/'):
+            pattern = pattern[:-1]
+
+        return re.compile(fnmatch.translate(pattern))
+
+    def _get_repo_info(self) -> Tuple[str, str]:
+        """Get the repository owner and name from the git remote"""
+        try:
+            # Get the GitHub remote URL
+            result = subprocess.run(
+                ['git', 'config', '--get', 'remote.origin.url'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            remote_url = result.stdout.strip()
+            
+            # Parse the URL to get owner and repo
+            # Handle both HTTPS and SSH URLs
+            if remote_url.startswith('https://'):
+                parts = remote_url.split('/')
+                owner = parts[-2]
+                repo = parts[-1].replace('.git', '')
+            else:  # SSH URL
+                parts = remote_url.split(':')[1].split('/')
+                owner = parts[-2]
+                repo = parts[-1].replace('.git', '')
+            
+            return owner, repo
+        except Exception as e:
+            print(f"Warning: Could not determine repository info: {e}", file=sys.stderr)
+            return "", ""
+
+    def _check_team_exists(self, org: str, team_slug: str) -> bool:
+        """Check if a team exists using GitHub API"""
+        cache_key = f"{org}/{team_slug}"
+        if cache_key in self._team_cache:
+            return self._team_cache[cache_key]
+
+        try:
+            # First try to get the repository's owner and name
+            repo_owner, repo_name = self._get_repo_info()
+            if not repo_owner or not repo_name:
+                return True  # Skip validation if we can't get repo info
+
+            # Check team access to the repository
+            result = subprocess.run(
+                ['gh', 'api', f'/repos/{repo_owner}/{repo_name}/teams'],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                teams_data = json.loads(result.stdout)
+                exists = any(team['slug'] == team_slug and team['organization']['login'] == org 
+                           for team in teams_data)
+                self._team_cache[cache_key] = exists
+                return exists
+            return True  # Assume team exists if API call fails
+        except Exception as e:
+            print(f"Warning: Could not validate team {org}/{team_slug}: {e}", file=sys.stderr)
+            return True  # Assume team exists if we can't validate
+
+    def _parse_owner(self, owner: str) -> Tuple[Optional[str], Optional[str]]:
+        """Parse an owner string into org and team components"""
+        if owner.startswith('@'):
+            parts = owner[1:].split('/')
+            if len(parts) == 2:
+                return parts[0], parts[1]
+        return None, None
+
+    @lru_cache(maxsize=1024)
+    def get_owners_for_file(self, filepath: str) -> List[str]:
+        """Get owners for a specific file with caching"""
+        relative_path = Path(filepath).resolve().relative_to(self.repo_root)
+        str_path = str(relative_path)
+        
+        matching_owners = []
+        for rule in reversed(self.rules):
+            if rule.regex.match(str_path):
+                if rule.negation:
+                    matching_owners = []
+                else:
+                    matching_owners = rule.owners
+                break
+        
+        return matching_owners
+
+    def list_files_with_owners(self, path=".", recursive=False) -> Dict[str, List[str]]:
+        """List all files and their owners with caching"""
+        cache = self._load_cache()
+        cache_key = f"{path}:{recursive}"
+        
+        if cache_key in cache:
+            return cache[cache_key]
+
+        start_path = Path(path).resolve()
+        if not start_path.exists():
+            print(f"Error: Path {path} does not exist", file=sys.stderr)
+            return {}
+
+        results = {}
+        if start_path.is_file():
+            owners = self.get_owners_for_file(start_path)
+            results[str(start_path.relative_to(self.repo_root))] = owners
+        else:
+            pattern = '**/*' if recursive else '*'
+            for filepath in start_path.glob(pattern):
+                if filepath.is_file():
+                    owners = self.get_owners_for_file(filepath)
+                    results[str(filepath.relative_to(self.repo_root))] = owners
+
+        cache[cache_key] = results
+        self._save_cache(cache)
+        return results
+
+    def list_files_by_owner(self, owner: str) -> Dict[str, List[str]]:
+        """List all files owned by a specific owner/team"""
+        all_files = self.list_files_with_owners(recursive=True)
+        return {path: owners for path, owners in all_files.items() if owner in owners}
+
+    def list_unowned_files(self) -> Dict[str, List[str]]:
+        """List files not covered by any CODEOWNERS rules"""
+        all_files = self.list_files_with_owners(recursive=True)
+        return {path: owners for path, owners in all_files.items() if not owners}
+
+    async def validate(self) -> List[ValidationIssue]:
+        """Comprehensive CODEOWNERS validation"""
+        issues = []
+
+        # Check for multiple CODEOWNERS files
+        codeowners_count = sum(1 for p in [
+            self.repo_root / "CODEOWNERS",
+            self.repo_root / ".github" / "CODEOWNERS",
+            self.repo_root / "docs" / "CODEOWNERS"
+        ] if p.exists())
+        
+        if codeowners_count > 1:
+            issues.append(ValidationIssue(
+                level="warning",
+                message="Multiple CODEOWNERS files found. Only the first one found will be used."
+            ))
+
+        # Validate team existence using GitHub API
+        for rule in self.rules:
+            for owner in rule.owners:
+                org, team = self._parse_owner(owner)
+                if org and team:
+                    if not self._check_team_exists(org, team):
+                        issues.append(ValidationIssue(
+                            level="warning",
+                            message=f"Team {owner} might not exist or might not have access to this repository",
+                            line_number=rule.line_number,
+                            pattern=rule.pattern
+                        ))
+
+        # Check for pattern overlaps
+        for i, rule1 in enumerate(self.rules):
+            for rule2 in self.rules[i + 1:]:
+                if rule1.pattern == rule2.pattern:
+                    issues.append(ValidationIssue(
+                        level="warning",
+                        message=f"Duplicate pattern: {rule1.pattern}",
+                        line_number=rule1.line_number,
+                        pattern=rule1.pattern
+                    ))
+
+        # Check for unowned files
+        unowned = self.list_unowned_files()
+        if unowned:
+            issues.append(ValidationIssue(
+                level="warning",
+                message=f"Found {len(unowned)} files with no ownership rules"
+            ))
+
+        return issues
+
+def format_output(data: Dict[str, List[str]], format_type: str = 'text') -> str:
+    """Format output in either text or JSON format"""
+    if format_type == 'json':
+        return json.dumps(data, indent=2)
+    
+    # Text format
+    output = []
+    for path, owners in sorted(data.items()):
+        if owners:
+            output.append(f"{path}: {' '.join(owners)}")
+        else:
+            output.append(f"{path}: (no owners)")
+    return '\n'.join(output)
+
+def main():
+    parser = argparse.ArgumentParser(description="GitHub CLI CODEOWNERS extension")
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # List command
+    list_parser = subparsers.add_parser('list', help='List files and their owners')
+    list_parser.add_argument('path', nargs='?', default='.', help='Path to file or directory')
+    list_parser.add_argument('--recursive', '-r', action='store_true', help='Recursively list files')
+    list_parser.add_argument('--owner', help='Filter by owner/team')
+    list_parser.add_argument('--unowned', action='store_true', help='Show only unowned files')
+    list_parser.add_argument('--format', choices=['text', 'json'], default='text',
+                            help='Output format (default: text)')
+    list_parser.add_argument('--no-cache', action='store_true',
+                            help='Disable caching of results')
+    list_parser.add_argument('--clear-cache', action='store_true',
+                            help='Clear the cache before running')
+
+    # Validate command
+    validate_parser = subparsers.add_parser('validate', help='Validate CODEOWNERS file')
+    validate_parser.add_argument('--format', choices=['text', 'json'], default='text',
+                                help='Output format (default: text)')
+
+    args = parser.parse_args()
+
+    try:
+        codeowners = CodeownersParser()
+        
+        if args.command == 'list':
+            if args.clear_cache:
+                codeowners.clear_cache()
+            elif args.no_cache:
+                # Clear the cache if --no-cache is specified
+                codeowners.clear_cache()
+
+            if args.unowned:
+                results = codeowners.list_unowned_files()
+            elif args.owner:
+                results = codeowners.list_files_by_owner(args.owner)
+            else:
+                results = codeowners.list_files_with_owners(args.path, args.recursive)
+
+            print(format_output(results, args.format))
+
+        elif args.command == 'validate':
+            import asyncio
+            issues = asyncio.run(codeowners.validate())
+            
+            if args.format == 'json':
+                print(json.dumps([asdict(issue) for issue in issues], indent=2))
+            else:
+                if not issues:
+                    print("No issues found. CODEOWNERS file is valid.")
+                else:
+                    for issue in issues:
+                        location = f" (line {issue.line_number})" if issue.line_number else ""
+                        pattern = f" pattern: {issue.pattern}" if issue.pattern else ""
+                        print(f"{issue.level.upper()}: {issue.message}{location}{pattern}")
+
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
